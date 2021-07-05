@@ -28,7 +28,7 @@ pub struct Instance {
 pub enum TimerControl {
     Start,
     Stop,
-    Reset,
+    ResetTo(Duration),
 }
 
 struct InstanceState {
@@ -46,11 +46,11 @@ struct InstanceState {
     handle: WorkerHandle,
     io_waiter: Option<IoWaiter>,
 
-    done: bool,
-
     fetch_response_channel: Option<tokio::sync::oneshot::Sender<ExecutionResult<ResponseObject>>>,
 
     appid: String,
+    detach_tx: Option<DetachResponse>,
+    detach_rx: Arc<Mutex<Option<DetachRequest>>>,
 }
 
 pub struct InstanceHandle {
@@ -59,6 +59,19 @@ pub struct InstanceHandle {
     termination_reason: TerminationReasonBox,
     creation_generation: IsolateGeneration,
     current_generation: IsolateGenerationBox,
+    detach_rx: Arc<Mutex<Option<DetachRequest>>>,
+}
+
+struct DetachRequest {
+    ack: tokio::sync::mpsc::Sender<()>,
+    done: tokio::sync::oneshot::Receiver<()>,
+    timeout_ms: u64,
+}
+
+struct DetachResponse {
+    ack: tokio::sync::mpsc::Receiver<()>,
+    _done: tokio::sync::oneshot::Sender<()>,
+    cpu_timeout_ms: u64,
 }
 
 pub struct InstanceTimeControl {
@@ -111,7 +124,7 @@ impl InstanceHandle {
         });
     }
 
-    pub async fn fetch(&self, req: RequestObject) -> ExecutionResult<ResponseObject> {
+    pub async fn fetch(self: Arc<Self>, req: RequestObject) -> ExecutionResult<ResponseObject> {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let (_io_scope, io_scope_consumer) = IoScope::new();
 
@@ -120,6 +133,45 @@ impl InstanceHandle {
             .send(Task::Fetch(req, result_tx, io_scope_consumer))
             .await
             .map_err(|_| ExecutionError::NoSuchWorker)?;
+
+        // Channel to notify that the fetch task is cancelled.
+        let (_kill_tx, kill_rx): (
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        ) = tokio::sync::oneshot::channel();
+
+        // Prepare for detach.
+        //
+        // Continue to run the instance if the request is cancelled. However if the instance is dropped,
+        // don't do that anymore. Keep resource limit enforced.
+        tokio::spawn(async move {
+            // Grab the IO scope to keep it alive.
+            let _io_scope = _io_scope;
+
+            // Don't hold strong reference to "self".
+            let this = Arc::downgrade(&self);
+            drop(self);
+
+            // Wait for "normal" execution.
+            drop(kill_rx.await);
+
+            // Check whether we are allowed to continue execution.
+            if let Some(this) = this.upgrade() {
+                let request = this.detach_rx.lock().unwrap().take();
+                if let Some(request) = request {
+                    if request.ack.try_send(()).is_ok() {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(request.timeout_ms)) => {
+                                debug!("detached task: timeout");
+                            }
+                            _ = request.done => {
+                                debug!("detached task: done");
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         // This errors if the instance terminates without sending a response
         match result_rx.await {
@@ -222,6 +274,7 @@ impl Instance {
 
         let isolate_handle = isolate.thread_safe_handle();
         let generation = isolate.get_slot::<IsolateGenerationBox>().unwrap();
+        let detach_rx = Arc::new(Mutex::new(None));
 
         let handle = InstanceHandle {
             isolate_handle,
@@ -229,6 +282,7 @@ impl Instance {
             termination_reason,
             creation_generation: *generation.0.lock().unwrap(),
             current_generation: generation.clone(),
+            detach_rx: detach_rx.clone(),
         };
         let instance = Instance {
             state: Some(InstanceState {
@@ -241,9 +295,10 @@ impl Instance {
                 conf: Arc::new(conf.clone()),
                 handle: worker_handle,
                 io_waiter: None,
-                done: false,
                 fetch_response_channel: None,
                 appid,
+                detach_tx: None,
+                detach_rx,
             }),
         };
         Ok((instance, handle, time_control))
@@ -337,14 +392,19 @@ impl Instance {
             let scope: &mut v8::HandleScope<'_> = try_catch.as_mut();
             let state = InstanceState::get(scope);
             state.stop_timer();
-            state.reset_timer();
+
+            let timer_timeout = Duration::from_millis(state.conf.executor.max_time_ms as u64);
+            state.reset_timer_to(timer_timeout);
 
             // Cleanup state
             state.io_waiter = None; // drop it
-            state.done = false;
+            state.detach_rx.lock().unwrap().take();
+            state.detach_tx.take();
 
             drop(permit);
 
+            // Try to receive a new task. If receive fails it means that the fetch() task is cancelled and we
+            // should stop.
             let task = match state.task_rx.blocking_recv() {
                 Some(x) => x,
                 None => {
@@ -380,8 +440,38 @@ impl Instance {
 
             // Drive to completion.
             loop {
+                // Waiting for I/O now. Stop the timer.
+                InstanceState::get(try_catch).stop_timer();
+
                 match try_catch.check_on_task() {
-                    Ok(()) => {}
+                    Ok(Some(reason)) => {
+                        try_catch.reset();
+                        match reason {
+                            NonErrorEarlyTermination::SentFetchResponse => {
+                                let state = InstanceState::get(try_catch);
+                                if let Some(ref mut detach_tx) = state.detach_tx {
+                                    // Wait for ack.
+                                    // We may block for some time so let's drop the CPU permit.
+                                    drop(permit);
+                                    let ok = detach_tx.ack.blocking_recv().is_some();
+                                    permit = worker_runtime.acquire_execution_token()?;
+                                    if ok {
+                                        let cpu_timeout_ms = detach_tx.cpu_timeout_ms;
+                                        state.reset_timer_to(Duration::from_millis(cpu_timeout_ms));
+                                        debug!("detached execution started");
+                                    } else {
+                                        debug!("failed to get ack from monitor");
+                                        break;
+                                    }
+                                }
+                            }
+                            NonErrorEarlyTermination::Done => {
+                                debug!("execution completion requested");
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
                     Err(e) => {
                         if e.terminates_worker() {
                             InstanceState::try_send_fetch_response(try_catch, Err(e.clone()));
@@ -396,14 +486,6 @@ impl Instance {
                 }
 
                 let scope = &mut v8::HandleScope::new(try_catch);
-                let state = InstanceState::get(scope);
-
-                if state.done {
-                    break;
-                }
-
-                // Waiting for I/O now. Stop the timer.
-                state.stop_timer();
 
                 // A nice point to update statistics!
                 update_stats(&worker_runtime, &worker_handle, scope);
@@ -416,22 +498,15 @@ impl Instance {
                 let wait_result = io_waiter.wait(scope);
                 InstanceState::get(scope).io_waiter = Some(io_waiter);
 
+                permit = worker_runtime.acquire_execution_token()?;
                 let (callback, data, buffers) = match wait_result {
                     Some(x) => x,
                     None => {
-                        // Doesn't necessarily need to terminate the instance but would need a lot of graceful
-                        // handling on both the proxy side and the script side.
-                        //
-                        // So just terminate it now.
-                        InstanceState::try_send_fetch_response(
-                            scope,
-                            Err(ExecutionError::IoTimeout),
-                        );
-                        return Err(GenericError::Execution(ExecutionError::IoTimeout));
+                        // IO timeout.
+                        break;
                     }
                 };
 
-                permit = worker_runtime.acquire_execution_token()?;
                 InstanceState::get(scope).start_timer();
 
                 let callback = v8::Local::<'_, v8::Function>::new(scope, callback);
@@ -459,15 +534,6 @@ impl Instance {
                     );
                 })?;
             }
-
-            // Script marked itself as done but we haven't got any response.
-            InstanceState::try_send_fetch_response(
-                try_catch,
-                Ok(ResponseObject {
-                    status: 500,
-                    ..Default::default()
-                }),
-            );
         }
         Ok(())
     }
@@ -498,8 +564,8 @@ impl InstanceState {
         drop(self.timer_tx.send(TimerControl::Stop));
     }
 
-    fn reset_timer(&self) {
-        drop(self.timer_tx.send(TimerControl::Reset));
+    fn reset_timer_to(&self, timeout: Duration) {
+        drop(self.timer_tx.send(TimerControl::ResetTo(timeout)));
     }
 
     /// Builds the global object.
@@ -689,8 +755,9 @@ fn call_service_callback(
                         state.worker_runtime.write_log(state.appid.clone(), s);
                     }
                     SyncCall::Done => {
-                        let state = InstanceState::get(scope);
-                        state.done = true;
+                        debug!("done() called");
+                        set_termination_reason(scope, TerminationReason::Done);
+                        scope.terminate_execution();
                     }
                     SyncCall::SendFetchResponse(mut res) => {
                         let body = local_buffers
@@ -709,7 +776,16 @@ fn call_service_callback(
                                 )
                             })?;
                         res.body = HttpBody::Binary(body);
-                        InstanceState::try_send_fetch_response(scope, Ok(res));
+                        if InstanceState::try_send_fetch_response(scope, Ok(res)) {
+                            // Terminate it.
+                            set_termination_reason(scope, TerminationReason::SentFetchResponse);
+                            scope.terminate_execution();
+                        } else {
+                            return Err(JsError::new(
+                                JsErrorKind::Error,
+                                Some("SendFetchResponse: already sent".into()),
+                            ));
+                        }
                     }
                     SyncCall::GetRandomValues => {
                         let output: &[Cell<u8>] = local_buffers.get(0).ok_or_else(|| {
@@ -740,6 +816,49 @@ fn call_service_callback(
                         if let Some(x) = inner.run(scope, local_buffers)? {
                             retval.set(x);
                         }
+                    }
+                    SyncCall::Detach(opts) => {
+                        let state = InstanceState::get(scope);
+
+                        if state.detach_tx.is_some() {
+                            return Err(JsError::new(
+                                JsErrorKind::Error,
+                                Some("Detach: already requested".into()),
+                            ));
+                        }
+
+                        if opts.cpu_timeout_ms > state.conf.executor.max_detached_cpu_time_ms as u64
+                        {
+                            return Err(JsError::new(
+                                JsErrorKind::Error,
+                                Some("Detach: cpu time exceeds limit".into()),
+                            ));
+                        }
+
+                        if opts.timeout_ms > state.conf.executor.max_detached_wall_time_ms as u64 {
+                            return Err(JsError::new(
+                                JsErrorKind::Error,
+                                Some("Detach: wall time exceeds limit".into()),
+                            ));
+                        }
+
+                        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel(1);
+                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                        let (req, res) = (
+                            DetachRequest {
+                                ack: ack_tx,
+                                done: done_rx,
+                                timeout_ms: opts.timeout_ms,
+                            },
+                            DetachResponse {
+                                ack: ack_rx,
+                                _done: done_tx,
+                                cpu_timeout_ms: opts.cpu_timeout_ms,
+                            },
+                        );
+
+                        state.detach_tx = Some(res);
+                        *state.detach_rx.lock().unwrap() = Some(req);
                     }
                 }
             }

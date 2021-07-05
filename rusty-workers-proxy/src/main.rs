@@ -88,6 +88,14 @@ struct Opt {
     /// Size of app cache.
     #[structopt(long, env = "RW_APP_CACHE_SIZE", default_value = "100")]
     pub app_cache_size: usize,
+
+    /// Max CPU time for detached execution.
+    #[structopt(long, env = "RW_MAX_DETACHED_CPU_TIME_MS", default_value = "100")]
+    pub max_detached_cpu_time_ms: u32,
+
+    /// Max wall time for detached execution.
+    #[structopt(long, env = "RW_MAX_DETACHED_WALL_TIME_MS", default_value = "15000")]
+    pub max_detached_wall_time_ms: u32,
 }
 
 #[tokio::main]
@@ -121,6 +129,8 @@ async fn main() -> Result<()> {
                     max_time_ms: opt.max_time_ms,
                     max_io_concurrency: opt.max_io_concurrency,
                     max_io_per_request: opt.max_io_per_request,
+                    max_detached_cpu_time_ms: opt.max_detached_cpu_time_ms,
+                    max_detached_wall_time_ms: opt.max_detached_wall_time_ms,
                 },
                 fetch_service,
                 env: Default::default(),

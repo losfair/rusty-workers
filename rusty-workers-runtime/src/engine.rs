@@ -21,6 +21,17 @@ pub enum TerminationReason {
 
     /// Instance terminated by cache policy.
     CachePolicy,
+
+    /// A fetch response is sent. Not really an error.
+    SentFetchResponse,
+
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NonErrorEarlyTermination {
+    SentFetchResponse,
+    Done,
 }
 
 /// Utility trait for converting a `Global` into a `Local`.
@@ -57,7 +68,7 @@ impl<T> CheckedResult for Option<T> {
 pub trait CheckedTryCatch {
     fn exception_description(&mut self) -> Option<String>;
     fn check_on_init(&mut self) -> GenericResult<()>;
-    fn check_on_task(&mut self) -> ExecutionResult<()>;
+    fn check_on_task(&mut self) -> ExecutionResult<Option<NonErrorEarlyTermination>>;
 }
 
 impl<'s, 'p: 's, P> CheckedTryCatch for v8::TryCatch<'s, P>
@@ -76,14 +87,24 @@ where
     }
 
     fn check_on_init(&mut self) -> GenericResult<()> {
-        self.check_on_task().map_err(GenericError::Execution)
+        self.check_on_task()
+            .map_err(GenericError::Execution)
+            .and_then(|x| {
+                if let Some(_) = x {
+                    Err(GenericError::Other(
+                        "non-error early termination is error during init".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
     }
 
-    fn check_on_task(&mut self) -> ExecutionResult<()> {
+    fn check_on_task(&mut self) -> ExecutionResult<Option<NonErrorEarlyTermination>> {
         match self.exception_description() {
             Some(x) => {
                 let e = if self.has_terminated() {
-                    match get_exception(self.as_mut()) {
+                    match get_termination_reason(self.as_mut()) {
                         TerminationReason::Unknown => {
                             // This should not happen.
                             warn!("check_on_task: termination requested without reason");
@@ -91,6 +112,10 @@ where
                         }
                         TerminationReason::TimeLimit => ExecutionError::TimeLimitExceeded,
                         TerminationReason::CachePolicy => ExecutionError::RuntimeThrowsException,
+                        TerminationReason::SentFetchResponse => {
+                            return Ok(Some(NonErrorEarlyTermination::SentFetchResponse))
+                        }
+                        TerminationReason::Done => return Ok(Some(NonErrorEarlyTermination::Done)),
                     }
                 } else {
                     // Otherwise this is a normal exception thrown from JavaScript.
@@ -98,7 +123,7 @@ where
                 };
                 Err(e)
             }
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 }
@@ -144,7 +169,7 @@ pub fn native_to_js<'s, T: serde::Serialize>(
     Ok(js_value)
 }
 
-fn get_exception(isolate: &mut v8::Isolate) -> TerminationReason {
+fn get_termination_reason(isolate: &mut v8::Isolate) -> TerminationReason {
     *isolate
         .get_slot_mut::<Option<TerminationReasonBox>>()
         .unwrap()
@@ -153,4 +178,15 @@ fn get_exception(isolate: &mut v8::Isolate) -> TerminationReason {
         .0
         .lock()
         .unwrap()
+}
+
+pub fn set_termination_reason(isolate: &mut v8::Isolate, reason: TerminationReason) {
+    *isolate
+        .get_slot_mut::<Option<TerminationReasonBox>>()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap() = reason;
 }

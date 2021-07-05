@@ -149,7 +149,6 @@ impl Runtime {
         mut timectl: InstanceTimeControl,
     ) {
         let mut deadline = None;
-        let initial_budget = timectl.budget;
 
         loop {
             tokio::select! {
@@ -168,8 +167,8 @@ impl Runtime {
                                 }
                                 deadline = None;
                             }
-                            TimerControl::Reset => {
-                                timectl.budget = initial_budget;
+                            TimerControl::ResetTo(timeout) => {
+                                timectl.budget = timeout;
                             }
                         }
                     } else {

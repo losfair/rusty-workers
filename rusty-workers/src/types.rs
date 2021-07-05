@@ -17,6 +17,12 @@ pub struct ExecutorConfiguration {
     pub max_time_ms: u32,
     pub max_io_concurrency: u32,
     pub max_io_per_request: u32,
+
+    #[serde(default)]
+    pub max_detached_cpu_time_ms: u32,
+
+    #[serde(default)]
+    pub max_detached_wall_time_ms: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]

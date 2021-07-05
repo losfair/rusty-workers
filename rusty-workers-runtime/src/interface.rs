@@ -18,6 +18,7 @@ pub enum SyncCall {
     GetRandomValues,
     GetFile(String),
     Crypto(crate::crypto::CryptoCall),
+    Detach(DetachOptions),
 }
 
 pub struct AsyncCall {
@@ -50,6 +51,12 @@ pub enum AsyncCallV {
         num_writes: u32,
         ttl_ms: u64,
     },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DetachOptions {
+    pub timeout_ms: u64,
+    pub cpu_timeout_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
